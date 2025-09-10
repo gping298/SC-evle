@@ -1,4 +1,4 @@
-// --- START OF FILE my.js ---
+// --- DynamicUUID  ---
 
 /**
  * Dynamic, Self-Verifying UUID Generator
@@ -147,12 +147,20 @@ import {
 
 export default {
 	async fetch(req, env) {
-		const UUIDKEY = env.UUIDKEY || 'default-secret-key-please-change-me';
+		// --- START: 改动点 1 ---
+		// 同时读取动态和静态UUID的配置，如果不存在则为空字符串
+		const UUIDKEY = env.UUIDKEY || '';
+		const UUID = env.UUID || '';
 		const UUIDTIME = parseInt(env.UUIDTIME, 10) || 24 * 60 * 60;
-		const dynamicUUID = new DynamicUUID(UUIDKEY, UUIDTIME);
+		// --- END: 改动点 1 ---
 
 
 		if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+			// 如果没有设置任何UUID，则拒绝连接
+			if (!UUIDKEY && !UUID) {
+				return new Response('缺少 UUIDKEY 或 UUID 配置', { status: 403 });
+			}
+			
 			const [client, ws] = Object.values(new WebSocketPair());
 			ws.accept();
 
@@ -206,7 +214,7 @@ export default {
 					port: +port
 				};
 			})() : null;
-			const PROXY_IP = proxyParam ? String(proxyParam) : 'proxyip.cmliussss.net:443';
+			const PROXY_IP = proxyParam ? String(proxyParam) : '3.112.21.102';
 
 			// auto模式参数顺序（按URL参数位置）
 			const getOrder = () => {
@@ -236,11 +244,9 @@ export default {
 				if (order.includes('proxy') && !order.includes('direct')) {
 					order.unshift('direct');
 				}
-
-				// --- START: 最终修改 ---
+				
 				// 没有参数时默认 direct, proxy
 				return order.length ? order : ['direct', 'proxy'];
-				// --- END: 最终修改 ---
 			};
 
 			let remote = null,
@@ -306,14 +312,38 @@ export default {
 
 					if (data.byteLength < 24) return;
 
-					// --- DYNAMIC UUID VALIDATION ---
-					const uuidBytes = new Uint8Array(data.slice(1, 17));
-					const receivedUUIDString = dynamicUUID._bytesToUUID(uuidBytes);
-					const isValid = await dynamicUUID.validate(receivedUUIDString);
-					if (!isValid) {
-						return;
+					// --- START: 改动点 2 - 统一的UUID验证逻辑 ---
+					let isValid = false;
+
+					if (UUIDKEY) {
+						// 动态UUID模式
+						const dynamicUUID = new DynamicUUID(UUIDKEY, UUIDTIME);
+						const uuidBytes = new Uint8Array(data.slice(1, 17));
+						const receivedUUIDString = dynamicUUID._bytesToUUID(uuidBytes);
+						isValid = await dynamicUUID.validate(receivedUUIDString);
+					} else if (UUID) {
+						// 静态UUID模式
+						const uuidBytes = new Uint8Array(data.slice(1, 17));
+						const expectedUUID = UUID.replace(/-/g, '');
+						
+						// 确保提供的静态UUID是有效的
+						if (expectedUUID.length === 32) {
+							let match = true;
+							for (let i = 0; i < 16; i++) {
+								if (uuidBytes[i] !== parseInt(expectedUUID.substr(i * 2, 2), 16)) {
+									match = false;
+									break;
+								}
+							}
+							isValid = match;
+						}
 					}
-					// --- END DYNAMIC UUID VALIDATION ---
+					// 如果两个环境变量都没设置，isValid 将保持 false
+
+					if (!isValid) {
+						return; // 验证失败，终止处理
+					}
+					// --- END: 改动点 2 ---
 
 					const view = new DataView(data);
 					const optLen = view.getUint8(17);
