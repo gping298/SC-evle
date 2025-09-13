@@ -476,8 +476,6 @@ export default {
 			});
 		}
 
-		const url = new URL(req.url);
-		url.hostname = 'example.com';
-		return fetch(new Request(url, req));
+		return Response.redirect('https://t.me/jiliankeji', 302);
 	}
 };
