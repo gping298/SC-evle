@@ -145,15 +145,92 @@ import {
 	connect
 } from 'cloudflare:sockets';
 
-export default {
-	async fetch(req, env) {
-		// --- START: 改动点 1 ---
-		// 同时读取动态和静态UUID的配置，如果不存在则为空字符串
-		const UUIDKEY = env.UUIDKEY || '';
-		const UUID = env.UUID || '';
-		const UUIDTIME = parseInt(env.UUIDTIME, 10) || 24 * 60 * 60;
-		// --- END: 改动点 1 ---
 
+const dohCache = new Map(); // 用于缓存DNS查询结果
+
+/**
+ * 使用DOH解析域名，并缓存结果
+ * @param {string} domain 需要解析的域名
+ * @param {Array<string>} servers DOH服务器列表
+ * @returns {Promise<string>} 解析成功返回IP地址，否则返回原域名
+ */
+async function resolveDomainOverDoH(domain, servers) {
+	// 1. 检查缓存中是否有有效的记录
+	const cached = dohCache.get(domain);
+	if (cached && cached.expires > Date.now()) {
+		return cached.ip;
+	}
+
+	// 2. 并发向所有DOH服务器发送请求，看谁最快返回
+	try {
+		const queries = servers.map(server =>
+			fetch(`${server}?name=${domain}&type=A`, { // 只查询A记录 (IPv4)
+				headers: { 'accept': 'application/dns-json' }
+			}).then(res => res.json())
+		);
+
+		const result = await Promise.any(queries);
+
+		const answer = result?.Answer?.find(a => a.type === 1); // type 1 is A record
+		if (answer && answer.data) {
+			const ip = answer.data;
+			const ttl = answer.TTL || 300; // 默认缓存5分钟
+			
+			// 3. 将成功的结果存入缓存
+			dohCache.set(domain, {
+				ip: ip,
+				expires: Date.now() + ttl * 1000
+			});
+			
+			console.log(`DOH resolved ${domain} -> ${ip}`);
+			return ip;
+		}
+	} catch (error) {
+		// 如果所有查询都失败，则不做任何事
+		console.error(`DOH resolution failed for ${domain}:`, error);
+	}
+
+	// 4. 如果解析失败，则返回原域名，让系统走默认DNS
+	return domain;
+}
+
+export default {
+	async fetch(req, env) { // env 参数现在可以忽略了
+		// --- START: 在这里直接写入你的配置 ---
+		const u = new URL(req.url); 
+        const path = u.pathname.slice(1);
+		
+		// 场景1：使用动态UUID (推荐)
+		const UUIDKEY = env.UUIDKEY || ''; // 从环境变量读取动态密钥，如果不存在则为空
+		const UUID = env.UUID || ''; // 从环境变量读取静态UUID，如果不存在则为空
+		const UUIDTIME = parseInt(env.UUIDTIME, 10) || 3 * 24 * 60 * 60; // 从环境变量读取有效期，默认3天
+		const SOCKS5 = env.SOCKS5 || '123:123@182.162.17.195:5555';
+		const ENABLE_FLOW_CONTROL = true; // 是否启用流量控制, true 为启用, false 为关闭
+		const FLOW_CONTROL_CHUNK_SIZE = 64 * 1024;
+		const ENABLE_DOH = true; // 是否启用DOH, true 为启用, false 为关闭
+		const DOH_SERVERS = [
+			"https://dns.google/resolve",       // Google Public DNS
+			"https://cloudflare-dns.com/dns-query" // Cloudflare DNS
+		];
+
+		/*
+		// 场景2：使用静态UUID
+		const UUIDKEY = ''; // 动态密钥留空
+		const UUID = 'd342d11e-d424-4583-b36e-524ab1f0afa4'; // 替换成你的静态UUID
+		const UUIDTIME = 0; // 不再需要
+		*/
+		if (path.startsWith('doh-test/')) {
+			const domainToTest = path.substring('doh-test/'.length);
+			if (domainToTest) {
+				console.log(`Performing DOH test for: ${domainToTest}`);
+				const ip = await resolveDomainOverDoH(domainToTest, DOH_SERVERS);
+				// 直接返回测试结果，不走WebSocket流程
+				return new Response(`DOH Test Result for: ${domainToTest}\nResolved IP: ${ip}\n\nWorker is working correctly.`, {
+					status: 200,
+					headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+				});
+			}
+		}
 
 		if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
 			// 如果没有设置任何UUID，则拒绝连接
@@ -163,8 +240,6 @@ export default {
 			
 			const [client, ws] = Object.values(new WebSocketPair());
 			ws.accept();
-
-			const u = new URL(req.url);
 
 			// 修复处理URL编码的查询参数  
 			if (u.pathname.includes('%3F')) {
@@ -181,7 +256,6 @@ export default {
 			let s5Param = u.searchParams.get('s5');
 			let proxyParam = u.searchParams.get('proxyip');
 			let pathBasedOrder = null; // 用于存储路径快捷方式强制设定的连接顺序
-			const path = u.pathname.slice(1);
 
 			// 规则3: /socks5:// -> 强制SOCKS5
 			if (path.startsWith('socks5://')) {
@@ -203,18 +277,20 @@ export default {
 
 
 			// 解析SOCKS5和ProxyIP (使用可能被路径快捷方式覆盖后的参数)
-			const socks5 = s5Param && s5Param.includes('@') ? (() => {
-				const [cred, server] = s5Param.split('@');
-				const [user, pass] = cred.split(':');
-				const [host, port = 443] = server.split(':');
-				return {
-					user,
-					pass,
-					host,
-					port: +port
-				};
-			})() : null;
-			const PROXY_IP = proxyParam ? String(proxyParam) : '3.112.21.102';
+			const effectiveS5Config = s5Param || SOCKS5;
+
+            const socks5 = effectiveS5Config && effectiveS5Config.includes('@') ? (() => {
+                const [cred, server] = effectiveS5Config.split('@');
+                const [user, pass] = cred.split(':');
+                const [host, port = 443] = server.split(':');
+                return {
+                    user,
+                    pass,
+                    host,
+                    port: +port
+                };
+            })() : null;
+			const PROXY_IP = proxyParam ? String(proxyParam) : (env.PROXYIP || 'proxyip.cmliussss.net');
 
 			// auto模式参数顺序（按URL参数位置）
 			const getOrder = () => {
@@ -246,7 +322,7 @@ export default {
 				}
 				
 				// 没有参数时默认 direct, proxy
-				return order.length ? order : ['direct', 'proxy'];
+				return order.length ? order : ['direct', 's5', 'proxy'];
 			};
 
 			let remote = null,
@@ -360,10 +436,19 @@ export default {
 						addr =
 							`${view.getUint8(pos)}.${view.getUint8(pos + 1)}.${view.getUint8(pos + 2)}.${view.getUint8(pos + 3)}`;
 						pos += 4;
-					} else if (type === 2) {
+					} else if (type === 2) { // 类型2代表目标地址是域名
 						const len = view.getUint8(pos++);
-						addr = new TextDecoder().decode(data.slice(pos, pos + len));
+						const domain = new TextDecoder().decode(data.slice(pos, pos + len));
 						pos += len;
+						
+						if (ENABLE_DOH) {
+							// 如果启用了DOH，则调用新函数来解析域名
+							addr = await resolveDomainOverDoH(domain, DOH_SERVERS);
+						} else {
+							// 否则，保持原样
+							addr = domain;
+						}
+						
 					} else if (type === 3) {
 						const ipv6 = [];
 						for (let i = 0; i < 8; i++, pos += 2) ipv6.push(view.getUint16(pos)
@@ -457,17 +542,46 @@ export default {
 					let sent = false;
 					sock.readable.pipeTo(new WritableStream({
 						write(chunk) {
-							if (ws.readyState === 1) {
-								ws.send(sent ? chunk : new Uint8Array([...header, ...
-									new Uint8Array(chunk)
-								]));
-								sent = true;
+							// 首先，检查WebSocket连接是否仍然处于打开状态
+							if (ws.readyState !== 1) {
+								return;
 							}
+
+							// 准备要发送的完整数据。第一次发送时，需要在数据前加上2字节的header
+							const dataToSend = sent ? chunk : new Uint8Array([...header, ...new Uint8Array(chunk)]);
+							sent = true; // 标记header已发送，后续不再添加
+
+							// --- START: 这里是新增的流量控制核心逻辑 ---
+							if (ENABLE_FLOW_CONTROL && dataToSend.length > FLOW_CONTROL_CHUNK_SIZE) {
+								// 如果启用了流控，并且数据大小超过了我们设定的分块大小，则进行分块发送
+								let offset = 0;
+								while (offset < dataToSend.length) {
+									const slice = dataToSend.slice(offset, offset + FLOW_CONTROL_CHUNK_SIZE);
+									// 每次发送前都检查连接状态
+									if (ws.readyState === 1) {
+										ws.send(slice);
+									} else {
+										break; // 如果在发送过程中连接断开，则立即停止
+									}
+									offset += FLOW_CONTROL_CHUNK_SIZE;
+								}
+							} else {
+								// 如果未启用流控，或者数据本身就很小，则直接一次性发送
+								ws.send(dataToSend);
+							}
+							// --- END: 流量控制核心逻辑结束 ---
 						},
-						close: () => ws.readyState === 1 && ws.close(),
-						abort: () => ws.readyState === 1 && ws.close()
-					})).catch(() => {});
-				}
+						close: () => {
+							if (ws.readyState === 1) ws.close();
+						},
+						abort: () => {
+							if (ws.readyState === 1) ws.close();
+						}
+					})).catch(() => {
+						// 捕获可能发生的错误，例如远程连接被重置
+						if (ws.readyState === 1) ws.close();
+					});
+			}
 			})).catch(() => {});
 
 			return new Response(null, {
